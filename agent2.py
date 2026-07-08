@@ -10,6 +10,9 @@ import pandas as pd
 load_dotenv()
 CSV_PATH = os.path.join(os.path.dirname(__file__), "drugs_side_effects_drugs_com.csv")
 
+# Single knob to control "how many results" everywhere in this file.
+TOP_N = 3
+
 def _load_csv() -> pd.DataFrame:
     """Load and clean the drugs CSV. Called once at import time."""
     if not os.path.exists(CSV_PATH):
@@ -85,6 +88,32 @@ def _find_condition(symptom: str) -> pd.DataFrame:
     q = symptom.lower().strip()
     return DF[DF["_condition_lower"].str.contains(q, na=False, regex=False)]
  
+def _top_side_effects(raw_text: str, n: int = TOP_N) -> list[str]:
+    """
+    The CSV's side_effects field is free-form prose (serious warnings +
+    a 'Common side effects ... may include: a; b; c.' tail), not a clean
+    list. This is a best-effort heuristic, not guaranteed-perfect parsing:
+      1. Prefer the text after 'may include:' (usually the common/mild list).
+      2. Fall back to the whole field if that phrase isn't present.
+      3. Split on ';' (the CSV's usual separator); if that yields only one
+         piece, try splitting on '. ' instead.
+      4. Clean up fragments and return the first n non-trivial ones.
+    """
+    if not raw_text or str(raw_text).strip().lower() == "nan":
+        return []
+    text = str(raw_text)
+    marker = "may include:"
+    idx = text.lower().rfind(marker)
+    segment = text[idx + len(marker):] if idx != -1 else text
+
+    parts = [p.strip(" .;") for p in segment.split(";")]
+    if len(parts) < 2:
+        parts = [p.strip(" .;") for p in segment.split(". ")]
+
+    cleaned = [p for p in parts if p and len(p) > 2]
+    return cleaned[:n]
+
+
 def _pregnancy_label(code: str) -> str:
     labels = {
         "A": "A — Safe (adequate studies show no risk)",
@@ -149,25 +178,18 @@ def check_drug_interactions(drugs: str) -> str:
                 results.append(rows.iloc[0])
         if not results:
             return f"❌ None of the medicines ({', '.join(drug_list)}) were found. Try using generic names."
-        response = f"🔍 Interaction check for: {', '.join(drug_list)}\n\n"
-        for rows in results:
-            response += f"💊 {rows['drug_name']} (Rx/OTC: {rows['rx_otc']})\n"
-            if str(rows['alcohol']).strip().upper() == "X":
-                response += "  ⚠️ Avoid alcohol with this medicine.\n"
-            if rows['rx_otc'] == "Rx":
-                response += "  🔒 Prescription only.\n"
-            if str(rows['pregnancy_category']).strip().upper() in ("D", "X"):
-                response += f"  🤰 Pregnancy risk: Category {rows['pregnancy_category']}.\n"
-        if not_found:
-            response += f"\n⚠️ Not found in database: {', '.join(not_found)}\n"
-        for drug_row in results:                # FIX #4: renamed loop var from 'rows' to 'drug_row'
-            response += f"💊 {drug_row['drug_name']} (Rx/OTC: {drug_row['rx_otc']})\n"
+
+        # Build a flat list of individual warning lines (one loop, no duplication),
+        # then only show the top N overall.
+        warnings = []
+        for drug_row in results:
+            header = f"💊 {drug_row['drug_name']} (Rx/OTC: {drug_row['rx_otc']})"
             if str(drug_row['alcohol']).strip().upper() == "X":
-                response += "  ⚠️ Avoid alcohol with this medicine.\n"
+                warnings.append(f"{header} — ⚠️ Avoid alcohol with this medicine.")
             if drug_row['rx_otc'] == "Rx":
-                response += "  🔒 Prescription only.\n"
+                warnings.append(f"{header} — 🔒 Prescription only.")
             if str(drug_row['pregnancy_category']).strip().upper() in ("D", "X"):
-                response += f"  🤰 Pregnancy risk: Category {drug_row['pregnancy_category']}.\n"
+                warnings.append(f"{header} — 🤰 Pregnancy risk: Category {drug_row['pregnancy_category']}.")
 
         drug_classes = []
         for drug_row in results:
@@ -178,16 +200,25 @@ def check_drug_interactions(drugs: str) -> str:
         seen_classes = {}
         for name, cls in drug_classes:
             if cls in seen_classes:
-                response += (
-                    f"\n⚠️ WARNING: '{name}' and '{seen_classes[cls]}' are in the same drug class "
-                    f"({cls}). Taking both may increase the risk of side effects.\n"
+                warnings.append(
+                    f"⚠️ '{name}' and '{seen_classes[cls]}' are in the same drug class "
+                    f"({cls}) — taking both may increase the risk of side effects."
                 )
             else:
                 seen_classes[cls] = name
 
+        response = f"🔍 Interaction check for: {', '.join(drug_list)}\n\n"
+        top_warnings = warnings[:TOP_N]
+        if top_warnings:
+            response += "\n".join(f"  {w}" for w in top_warnings) + "\n"
+        else:
+            response += "  No notable individual warnings found for these medicines.\n"
+        if len(warnings) > TOP_N:
+            response += f"\n(Showing top {TOP_N} of {len(warnings)} warnings found.)\n"
+
         if not_found:
             response += f"\n⚠️ Not found in database: {', '.join(not_found)}\n"
-        
+
         response += (
             "\n⚠️ IMPORTANT: This tool can only show individual drug warnings.\n"
             "It cannot detect all drug-drug interactions.\n"
@@ -209,14 +240,18 @@ def suggest_medicine_for_symptoms(symptom: str) -> str:
             return "⚠️ Please provide valid symptoms or condition to get medicine suggestions."
         rows = _find_condition(symptom)
         if rows.empty:
-            conditions = DF["medical_condition"].dropna().unique()[:15]
+            conditions = DF["medical_condition"].dropna().unique()[:TOP_N]
             return (
                 f"❌ No results for '{symptom}'.\n"
-                f"Available conditions: {', '.join(conditions)}"
+                f"Closest available conditions: {', '.join(conditions)}"
             )
-        drugs = rows["drug_name"].dropna().unique()[:5]
+        # Prefer higher-rated medicines when picking the top N, same logic as _find_rows.
+        subset = rows.dropna(subset=["drug_name"])
+        if "rating" in subset.columns:
+            subset = subset.sort_values("rating", ascending=False)
+        drugs = subset["drug_name"].drop_duplicates().head(TOP_N).tolist()
         return (
-            f"for symptom/condition '{symptom}', commonly used medicines include:\n"
+            f"For symptom/condition '{symptom}', top {len(drugs)} commonly used medicines:\n"
             f"{', '.join(drugs)}\n\n"
             f"⚠️ Always consult a doctor before taking any medicine."
         )
@@ -234,10 +269,14 @@ def get_side_effects(medicine: str) -> str:
         if rows.empty:
             return f"⚠️ No information found for medicine: '{medicine}'. Please check the name and try again."
         row = rows.iloc[0]
-        side_effects = str(row['side_effects'])
+        top_effects = _top_side_effects(row['side_effects'], TOP_N)
+        if top_effects:
+            effects_block = "\n".join(f"   • {e}" for e in top_effects)
+        else:
+            effects_block = "   No side effect data available for this medicine."
         return (
-            f"⚠️ Side Effects for: {row['drug_name']}\n\n"
-            f"{side_effects}\n\n"
+            f"⚠️ Top {len(top_effects)} Side Effects for: {row['drug_name']}\n\n"
+            f"{effects_block}\n\n"
             f"🤰Pregnancy Precautions: {_pregnancy_label(str(row['pregnancy_category']))}\n"
             f"🍺 Alcohol Warning    : {'⚠️ Avoid alcohol' if str(row['alcohol']).strip().upper() == 'X' else 'No major interaction noted'}\n\n"
             "If you experience severe side effects, consult a doctor immediately."
