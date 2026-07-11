@@ -408,28 +408,39 @@ def create_agent() -> AgentExecutor:
     )
     return agent_executor
 
-def chat(user_input: str, agent_executor: AgentExecutor) -> dict:
+def chat(user_input: str, agent_executor: AgentExecutor, session_history: list = None) -> dict:
     """
+    session_history: pass a list of HumanMessage/AIMessage for THIS conversation only.
+    Pass None to fall back to the module-level global (only safe for a single-user CLI —
+    NEVER pass None in a multi-user server, or every user's history will bleed together).
+
     Returns a dict:
       {
         "reply": str,            # natural-language answer for the user
-        "tool_results": list     # raw structured data from each tool call this turn, e.g.
+        "tool_results": list,    # raw structured data from each tool call this turn, e.g.
                                   # [{"tool": "get_side_effects", "input": {...}, "data": {...}}]
+        "history": list          # updated history — caller must store this and pass it back in next turn
       }
     tool_results holds the actual parsed JSON each tool returned (already json.loads'd),
     independent of how the LLM chose to phrase its reply — use this for anything programmatic.
     """
     global chat_history
-    tool_results = []
-    try:
+    using_global = session_history is None
+    if using_global:
         if chat_history is None:
             chat_history = []
+        history = chat_history
+    else:
+        history = session_history
+
+    tool_results = []
+    try:
         if agent_executor is None:
             agent_executor = create_agent()
         try:
             response = agent_executor.invoke({
                 "input": user_input,
-                "chat_history": list(chat_history),
+                "chat_history": list(history),
             })
             if response is None:
                 output = "No response generated. Please try again."
@@ -453,15 +464,17 @@ def chat(user_input: str, agent_executor: AgentExecutor) -> dict:
             output = f"I encountered an error: {str(e)}. Please rephrase your question."
         if not output:
             output = "I'm not sure how to respond. Could you rephrase?"
-        chat_history.append(HumanMessage(content=user_input))
-        chat_history.append(AIMessage(content=output))
-        chat_history = chat_history[-20:]
+        history.append(HumanMessage(content=user_input))
+        history.append(AIMessage(content=output))
+        history = history[-20:]
+        if using_global:
+            chat_history = history
 
-        return {"reply": output, "tool_results": tool_results}
+        return {"reply": output, "tool_results": tool_results, "history": history}
 
     except Exception as e:
         print(f"Error in chat function: {e}")
-        return {"reply": "I encountered an error. Please try again.", "tool_results": tool_results}
+        return {"reply": "I encountered an error. Please try again.", "tool_results": tool_results, "history": history}
 
 def main():
     agent_executor = create_agent()
